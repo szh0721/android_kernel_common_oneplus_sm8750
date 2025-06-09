@@ -15,6 +15,7 @@ bool zswap_load(struct folio *folio);
 void zswap_invalidate(int type, pgoff_t offset);
 void zswap_swapon(int type);
 void zswap_swapoff(int type);
+bool zswap_is_enabled(void);
 bool zswap_never_enabled(void);
 
 #else
