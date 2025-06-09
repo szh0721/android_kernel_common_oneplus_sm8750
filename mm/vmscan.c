@@ -8280,17 +8280,43 @@ unsigned long shrink_all_memory(unsigned long nr_to_reclaim)
 void __meminit kswapd_run(int nid)
 {
 	pg_data_t *pgdat = NODE_DATA(nid);
+	int ret;
 
 	pgdat_kswapd_lock(pgdat);
 	if (!pgdat->kswapd) {
 		pgdat->kswapd = kthread_run(kswapd, pgdat, "kswapd%d", nid);
 		if (IS_ERR(pgdat->kswapd)) {
-			/* failure at boot is fatal */
+			/* Failure at boot is fatal */
 			BUG_ON(system_state < SYSTEM_RUNNING);
 			pr_err("Failed to start kswapd on node %d\n", nid);
 			pgdat->kswapd = NULL;
+			goto out;
 		}
+
+		/* Initialize kcompressd only if kswapd is successfully created */
+		ret = kfifo_alloc(&pgdat->kcompress_fifo,
+				  KCOMPRESS_FIFO_SIZE * sizeof(struct folio *),
+				  GFP_KERNEL);
+		if (ret) {
+			pr_err("%s: failed to allocate kcompress_fifo\n", __func__);
+			goto out;
+		}
+
+		printk(KERN_INFO "Kcompressd-Unofficial 0.3 by Masahito Suzuki (forked from Kcompressd by Qun-Wei Lin from MediaTek)\n");
+		spin_lock_init(&pgdat->kcompress_fifo_lock);
+		pgdat->kcompressd = kthread_create_on_node(kcompressd, pgdat, nid,
+							   "kcompressd%d", nid);
+		if (IS_ERR(pgdat->kcompressd)) {
+			pr_err("Failed to start kcompressd on node %d, ret=%ld\n",
+			       nid, PTR_ERR(pgdat->kcompressd));
+			kfifo_free(&pgdat->kcompress_fifo);
+			pgdat->kcompressd = NULL;
+			goto out;
+		}
+
+		wake_up_process(pgdat->kcompressd);
 	}
+out:
 	pgdat_kswapd_unlock(pgdat);
 }
 
@@ -8308,6 +8334,11 @@ void __meminit kswapd_stop(int nid)
 	if (kswapd) {
 		kthread_stop(kswapd);
 		pgdat->kswapd = NULL;
+	}
+	if (pgdat->kcompressd) {
+		kthread_stop(pgdat->kcompressd);
+		pgdat->kcompressd = NULL;
+		kfifo_free(&pgdat->kcompress_fifo);
 	}
 	pgdat_kswapd_unlock(pgdat);
 }

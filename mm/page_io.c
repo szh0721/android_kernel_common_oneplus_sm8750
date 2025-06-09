@@ -25,6 +25,8 @@
 #include <linux/sched/task.h>
 #include <linux/delayacct.h>
 #include <linux/zswap.h>
+#include <linux/cpumask.h>
+#include <linux/kfifo.h>
 #include "swap.h"
 
 #undef CREATE_TRACE_POINTS
@@ -175,6 +177,68 @@ bad_bmap:
 	goto out;
 }
 
+static inline void do_swapout(struct folio *folio)
+{
+	struct writeback_control wbc = {
+		.sync_mode = WB_SYNC_NONE,
+		.nr_to_write = SWAP_CLUSTER_MAX,
+		.range_start = 0,
+		.range_end = LLONG_MAX,
+		.for_reclaim = 1,
+	};
+
+	if (zswap_store(folio)) {
+		count_mthp_stat(folio_order(folio), MTHP_STAT_ZSWPOUT);
+		folio_unlock(folio);
+		return;
+	}
+	__swap_writepage(&folio->page, &wbc);
+}
+
+static bool kcompressd_store(struct folio *folio)
+{
+	struct swap_info_struct *sis = swp_swap_info(folio->swap);
+	int nid = numa_node_id();
+	pg_data_t *pgdat = NODE_DATA(nid);
+	unsigned int ret, sysctl_kcompressd = vm_kcompressd;
+	struct folio *head = NULL;
+
+	if (!sysctl_kcompressd)
+		return false;
+
+	if (unlikely(!pgdat->kcompressd))
+		return false;
+
+	if (!current_is_kswapd())
+		return false;
+
+	if (!folio_test_anon(folio))
+		return false;
+	/*
+	 * This case needs to synchronously return AOP_WRITEPAGE_ACTIVATE
+	 */
+	if (!mem_cgroup_zswap_writeback_enabled(folio_memcg(folio)))
+		return false;
+
+	sis = swp_swap_info(folio->swap);
+	if (!zswap_is_enabled() && !data_race(sis->flags & SWP_SYNCHRONOUS_IO))
+		return false;
+
+	scoped_guard(spinlock, &pgdat->kcompress_fifo_lock)
+		if (kfifo_len(&pgdat->kcompress_fifo) >= sysctl_kcompressd * sizeof(folio) &&
+				unlikely(!kfifo_out(&pgdat->kcompress_fifo, &head, sizeof(folio))))
+			return false;
+
+	ret = kfifo_in(&pgdat->kcompress_fifo, &folio, sizeof(folio));
+	if (likely(ret))
+		wake_up_interruptible(&pgdat->kcompressd_wait);
+
+	if (head)
+		do_swapout(head);
+
+	return ret;
+}
+
 /*
  * We may have stale swap cache pages in memory: notice
  * them here and get rid of the unnecessary final write.
@@ -198,6 +262,15 @@ int swap_writepage(struct page *page, struct writeback_control *wbc)
 		folio_unlock(folio);
 		return ret;
 	}
+
+	/*
+	 * Compression within zswap and zram might block rmap, unmap
+	 * of both file and anon pages, try to do compression async
+	 * if possible
+	 */
+	if (kcompressd_store(folio))
+		return 0;
+
 	if (zswap_store(folio)) {
 		folio_start_writeback(folio);
 		folio_unlock(folio);
@@ -205,6 +278,21 @@ int swap_writepage(struct page *page, struct writeback_control *wbc)
 		return 0;
 	}
 	__swap_writepage(&folio->page, wbc);
+	return 0;
+}
+
+int kcompressd(void *p)
+{
+	pg_data_t *pgdat = (pg_data_t *)p;
+	struct folio *folio;
+
+	while (!kthread_should_stop()) {
+		wait_event_interruptible(pgdat->kcompressd_wait,
+				!kfifo_is_empty(&pgdat->kcompress_fifo));
+
+		while (kfifo_out_locked(&pgdat->kcompress_fifo, &folio, sizeof(folio), &pgdat->kcompress_fifo_lock))
+			do_swapout(folio);
+	}
 	return 0;
 }
 
