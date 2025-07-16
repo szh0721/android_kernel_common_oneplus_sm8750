@@ -871,6 +871,13 @@ config CHARGER_BD99954
 	  information and altering charger configurations from the ROHM
 	  BD99954 charger IC.
 
+config UNRESTRICTED_CHARGING
+    bool
+    default y
+    help
+        This module controls sysfs nodes for battery and charging management.
+        Enable this to manipulate sysfs nodes like /sys/class/oplus_chg/*.
+
 config CHARGER_WILCO
 	tristate "Wilco EC based charger for ChromeOS"
 	depends on WILCO_EC
