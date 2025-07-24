@@ -979,6 +979,7 @@ struct mm_struct {
 		u32 pasid;
 #endif
 #ifdef CONFIG_KSM
+#ifndef __GENKSYMS__
 		/*
 		 * Represent how many pages of this process are involved in KSM
 		 * merging (not including ksm_zero_pages).
@@ -994,6 +995,7 @@ struct mm_struct {
 		 * pages when enabling KSM use_zero_pages.
 		 */
 		atomic_long_t ksm_zero_pages;
+#endif
 #endif /* CONFIG_KSM */
 #ifdef CONFIG_LRU_GEN
 		struct {

@@ -21,6 +21,7 @@
 #include <linux/sched.h>
 #include <linux/sched/mm.h>
 #include <linux/sched/coredump.h>
+#include <linux/sched/cputime.h>
 #include <linux/rwsem.h>
 #include <linux/pagemap.h>
 #include <linux/rmap.h>
@@ -55,6 +56,8 @@
 #define NUMA(x)		(0)
 #define DO_NUMA(x)	do { } while (0)
 #endif
+
+typedef u8 rmap_age_t;
 
 /**
  * DOC: Overview
@@ -193,6 +196,8 @@ struct ksm_stable_node {
  * @node: rb node of this rmap_item in the unstable tree
  * @head: pointer to stable_node heading this list in the stable tree
  * @hlist: link into hlist of rmap_items hanging off that stable_node
+ * @age: number of scan iterations since creation
+ * @remaining_skips: how many scans to skip
  */
 struct ksm_rmap_item {
 	struct ksm_rmap_item *rmap_list;
@@ -205,6 +210,8 @@ struct ksm_rmap_item {
 	struct mm_struct *mm;
 	unsigned long address;		/* + low bits used for flags below */
 	unsigned int oldchecksum;	/* when unstable */
+	rmap_age_t age;
+	rmap_age_t remaining_skips;
 	union {
 		struct rb_node node;	/* when node of unstable tree */
 		struct {		/* when listed from stable tree */
@@ -242,6 +249,9 @@ static struct kmem_cache *rmap_item_cache;
 static struct kmem_cache *stable_node_cache;
 static struct kmem_cache *mm_slot_cache;
 
+/* Default number of pages to scan per batch */
+#define DEFAULT_PAGES_TO_SCAN 100
+
 /* The number of pages scanned */
 static unsigned long ksm_pages_scanned;
 
@@ -270,7 +280,7 @@ static unsigned int ksm_stable_node_chains_prune_millisecs = 2000;
 static int ksm_max_page_sharing = 256;
 
 /* Number of pages ksmd should scan in one batch */
-static unsigned int ksm_thread_pages_to_scan = 100;
+static unsigned int ksm_thread_pages_to_scan = DEFAULT_PAGES_TO_SCAN;
 
 /* Milliseconds ksmd should sleep between batches */
 static unsigned int ksm_thread_sleep_millisecs = 20;
@@ -281,8 +291,172 @@ static unsigned int zero_checksum __read_mostly;
 /* Whether to merge empty (zeroed) pages with actual zero pages */
 static bool ksm_use_zero_pages __read_mostly;
 
+/* Skip pages that couldn't be de-duplicated previously  */
+static bool ksm_smart_scan = 1;
+
 /* The number of zero pages which is placed by KSM */
 atomic_long_t ksm_zero_pages = ATOMIC_LONG_INIT(0);
+
+/* The number of pages that have been skipped due to "smart scanning" */
+static unsigned long ksm_pages_skipped;
+
+/* Don't scan more than max pages per batch. */
+static unsigned long ksm_advisor_max_pages = 30000;
+
+/* At least scan this many pages per batch. */
+static unsigned long ksm_advisor_min_pages = 500;
+
+/* Min CPU for scanning pages per scan */
+static unsigned int ksm_advisor_min_cpu =  5;
+
+/* Max CPU for scanning pages per scan */
+static unsigned int ksm_advisor_max_cpu =  25;
+
+/* Target scan time in seconds to analyze all KSM candidate pages. */
+static unsigned long ksm_advisor_target_scan_time = 200;
+
+/* Exponentially weighted moving average. */
+#define EWMA_WEIGHT 30
+
+/**
+ * struct advisor_ctx - metadata for KSM advisor
+ * @start_scan: start time of the current scan
+ * @scan_time: scan time of previous scan
+ * @change: change in percent to pages_to_scan parameter
+ * @cpu_percent: average cpu percent usage of the ksmd thread for the last scan
+ */
+struct advisor_ctx {
+	ktime_t start_scan;
+	unsigned long scan_time;
+	unsigned long change;
+	unsigned long long cpu_time;
+};
+static struct advisor_ctx advisor_ctx;
+
+/* Define different advisor's */
+enum ksm_advisor_type {
+	KSM_ADVISOR_NONE,
+	KSM_ADVISOR_FIRST = KSM_ADVISOR_NONE,
+	KSM_ADVISOR_SCAN_TIME,
+	KSM_ADVISOR_LAST = KSM_ADVISOR_SCAN_TIME
+};
+static enum ksm_advisor_type ksm_advisor = KSM_ADVISOR_SCAN_TIME;
+
+static void init_advisor(void)
+{
+	advisor_ctx.start_scan = 0;
+	advisor_ctx.scan_time = 0;
+	advisor_ctx.change = 0;
+	advisor_ctx.cpu_time = 0;
+}
+
+static void set_advisor_defaults(void)
+{
+	if (ksm_advisor == KSM_ADVISOR_NONE)
+		ksm_thread_pages_to_scan = DEFAULT_PAGES_TO_SCAN;
+	else if (ksm_advisor == KSM_ADVISOR_SCAN_TIME)
+		ksm_thread_pages_to_scan = ksm_advisor_min_pages;
+}
+
+/*
+ * Use previous scan time if available, otherwise use current scan time as an
+ * approximation for the previous scan time.
+ */
+static inline unsigned long prev_scan_time(struct advisor_ctx *ctx,
+					   unsigned long scan_time)
+{
+	return ctx->scan_time ? ctx->scan_time : scan_time;
+}
+
+/* Calculate exponential weighted moving average */
+static unsigned long ewma(unsigned long prev, unsigned long curr)
+{
+	return ((100 - EWMA_WEIGHT) * prev + EWMA_WEIGHT * curr) / 100;
+}
+
+/*
+ * The scan time advisor is based on the current scan rate and the target
+ * scan rate.
+ *
+ *      new_pages_to_scan = pages_to_scan * (scan_time / target_scan_time)
+ *
+ * To avoid pertubations it calculates a change factor of previous changes.
+ * A new change factor is calculated for each iteration and it uses an
+ * exponentially weighted moving average. The new pages_to_scan value is
+ * multiplied with that change factor:
+ *
+ *      new_pages_to_scan *= change facor
+ *
+ * In addition the new pages_to_scan value is capped by the max and min
+ * limits.
+ */
+static void scan_time_advisor(unsigned long scan_time)
+{
+	unsigned int cpu_percent;
+	unsigned long cpu_time;
+	unsigned long cpu_time_diff;
+	unsigned long cpu_time_diff_ms;
+	unsigned long pages;
+	unsigned long per_page_cost;
+	unsigned long factor;
+	unsigned long change;
+	unsigned long last_scan_time;
+
+	cpu_time = task_sched_runtime(current);
+	cpu_time_diff = cpu_time - advisor_ctx.cpu_time;
+	cpu_time_diff_ms = cpu_time_diff / 1000 / 1000;
+
+	cpu_percent = (cpu_time_diff_ms * 100) / (scan_time * 1000);
+	cpu_percent = cpu_percent ? cpu_percent : 1;
+	last_scan_time = prev_scan_time(&advisor_ctx, scan_time);
+
+	/* Calculate scan time as percentage of target scan time */
+	factor = ksm_advisor_target_scan_time * 100 / scan_time;
+	factor = factor ? factor : 1;
+
+	/*
+	 * Calculate scan time as percentage of last scan time and use
+	 * exponentially weighted average to smooth it
+	 */
+	change = scan_time * 100 / last_scan_time;
+	change = change ? change : 1;
+	change = ewma(advisor_ctx.change, change);
+
+	/* Calculate new scan rate based on target scan rate. */
+	pages = ksm_thread_pages_to_scan * 100 / factor;
+	/* Update pages_to_scan by weighted change percentage. */
+	pages = pages * change / 100;
+
+	/* Cap new pages_to_scan value */
+	per_page_cost = ksm_thread_pages_to_scan / cpu_percent;
+	per_page_cost = per_page_cost ? per_page_cost : 1;
+
+	pages = min(pages, per_page_cost * ksm_advisor_max_cpu);
+	pages = max(pages, per_page_cost * ksm_advisor_min_cpu);
+	pages = min(pages, ksm_advisor_max_pages);
+
+	/* Update advisor context */
+	advisor_ctx.change = change;
+	advisor_ctx.scan_time = scan_time;
+	advisor_ctx.cpu_time = cpu_time;
+
+	ksm_thread_pages_to_scan = pages;
+	trace_ksm_advisor(scan_time, pages, cpu_percent);
+}
+
+static void run_advisor(void)
+{
+	if (ksm_advisor == KSM_ADVISOR_SCAN_TIME) {
+		s64 scan_time;
+
+		/* Convert scan time to seconds */
+		scan_time = ktime_ms_delta(ktime_get(), advisor_ctx.start_scan);
+		scan_time = div_s64(scan_time, MSEC_PER_SEC);
+		scan_time = scan_time ? scan_time : 1;
+
+		scan_time_advisor((unsigned long)scan_time);
+	}
+}
 
 #ifdef CONFIG_NUMA
 /* Zeroed when merging across nodes is not allowed */
@@ -297,7 +471,7 @@ static int ksm_nr_node_ids = 1;
 #define KSM_RUN_MERGE	1
 #define KSM_RUN_UNMERGE	2
 #define KSM_RUN_OFFLINE	4
-static unsigned long ksm_run = KSM_RUN_STOP;
+static unsigned long ksm_run = KSM_RUN_MERGE;
 static void wait_while_offlining(void);
 
 static DECLARE_WAIT_QUEUE_HEAD(ksm_thread_wait);
@@ -2307,6 +2481,74 @@ static struct ksm_rmap_item *get_next_rmap_item(struct ksm_mm_slot *mm_slot,
 	return rmap_item;
 }
 
+/*
+ * Calculate skip age for the ksm page age. The age determines how often
+ * de-duplicating has already been tried unsuccessfully. If the age is
+ * smaller, the scanning of this page is skipped for less scans.
+ *
+ * @age: rmap_item age of page
+ */
+static unsigned int skip_age(rmap_age_t age)
+{
+	if (age <= 3)
+		return 1;
+	if (age <= 5)
+		return 2;
+	if (age <= 8)
+		return 4;
+
+	return 8;
+}
+
+/*
+ * Determines if a page should be skipped for the current scan.
+ *
+ * @page: page to check
+ * @rmap_item: associated rmap_item of page
+ */
+static bool should_skip_rmap_item(struct page *page,
+				  struct ksm_rmap_item *rmap_item)
+{
+	rmap_age_t age;
+
+	if (!ksm_smart_scan)
+		return false;
+
+	/*
+	 * Never skip pages that are already KSM; pages cmp_and_merge_page()
+	 * will essentially ignore them, but we still have to process them
+	 * properly.
+	 */
+	if (PageKsm(page))
+		return false;
+
+	age = rmap_item->age;
+	if (age != U8_MAX)
+		rmap_item->age++;
+
+	/*
+	 * Smaller ages are not skipped, they need to get a chance to go
+	 * through the different phases of the KSM merging.
+	 */
+	if (age < 3)
+		return false;
+
+	/*
+	 * Are we still allowed to skip? If not, then don't skip it
+	 * and determine how much more often we are allowed to skip next.
+	 */
+	if (!rmap_item->remaining_skips) {
+		rmap_item->remaining_skips = skip_age(age);
+		return false;
+	}
+
+	/* Skip this page */
+	ksm_pages_skipped++;
+	rmap_item->remaining_skips--;
+	remove_rmap_item_from_tree(rmap_item);
+	return true;
+}
+
 static struct ksm_rmap_item *scan_get_next_rmap_item(struct page **page)
 {
 	struct mm_struct *mm;
@@ -2322,6 +2564,7 @@ static struct ksm_rmap_item *scan_get_next_rmap_item(struct page **page)
 
 	mm_slot = ksm_scan.mm_slot;
 	if (mm_slot == &ksm_mm_head) {
+		advisor_ctx.start_scan = ktime_get();
 		trace_ksm_start_scan(ksm_scan.seqnr, ksm_rmap_items);
 
 		/*
@@ -2411,6 +2654,10 @@ next_mm:
 				if (rmap_item) {
 					ksm_scan.rmap_list =
 							&rmap_item->rmap_list;
+
+					if (should_skip_rmap_item(*page, rmap_item))
+						goto next_page;
+
 					ksm_scan.address += PAGE_SIZE;
 				} else
 					put_page(*page);
@@ -2475,6 +2722,8 @@ no_vmas:
 	if (mm_slot != &ksm_mm_head)
 		goto next_mm;
 
+	run_advisor();
+
 	trace_ksm_stop_scan(ksm_scan.seqnr, ksm_rmap_items);
 	ksm_scan.seqnr++;
 	return NULL;
@@ -2509,28 +2758,52 @@ static int ksm_scan_thread(void *nothing)
 {
 	unsigned int sleep_ms;
 
+	// Log when the KSM scan thread starts
+	pr_info("KSM: Scan thread starting.\n");
+
 	set_freezable();
 	set_user_nice(current, 5);
 
 	while (!kthread_should_stop()) {
+		pr_debug("KSM: Scan thread iteration begins.\n"); // Debug level for frequent events
+
 		mutex_lock(&ksm_thread_mutex);
+		pr_debug("KSM: Acquired ksm_thread_mutex.\n");
+
 		wait_while_offlining();
-		if (ksmd_should_run())
+		// You could add a log here if wait_while_offlining did something significant
+
+		if (ksmd_should_run()) {
+			pr_info("KSM: Performing memory scan for %u pages.\n", ksm_thread_pages_to_scan);
 			ksm_do_scan(ksm_thread_pages_to_scan);
+			pr_info("KSM: Memory scan completed.\n");
+		} else {
+			pr_debug("KSM: ksmd_should_run() is false, skipping scan.\n");
+		}
 		mutex_unlock(&ksm_thread_mutex);
+		pr_debug("KSM: Released ksm_thread_mutex.\n");
 
 		try_to_freeze();
 
 		if (ksmd_should_run()) {
 			sleep_ms = READ_ONCE(ksm_thread_sleep_millisecs);
+			pr_debug("KSM: Waiting for %u ms or until sleep duration changes.\n", sleep_ms);
 			wait_event_interruptible_timeout(ksm_iter_wait,
-				sleep_ms != READ_ONCE(ksm_thread_sleep_millisecs),
-				msecs_to_jiffies(sleep_ms));
+											 sleep_ms != READ_ONCE(ksm_thread_sleep_millisecs),
+											 msecs_to_jiffies(sleep_ms));
+			if (sleep_ms != READ_ONCE(ksm_thread_sleep_millisecs)) {
+				pr_debug("KSM: Sleep duration changed during wait.\n");
+			}
 		} else {
+			pr_info("KSM: Thread is not running, waiting for activation or stop signal.\n");
 			wait_event_freezable(ksm_thread_wait,
-				ksmd_should_run() || kthread_should_stop());
+								 ksmd_should_run() || kthread_should_stop());
+			pr_info("KSM: Thread woke up from wait_event_freezable.\n");
 		}
 	}
+
+	// Log when the KSM scan thread is stopping
+	pr_info("KSM: Scan thread stopping.\n");
 	return 0;
 }
 
@@ -3387,6 +3660,13 @@ static ssize_t pages_volatile_show(struct kobject *kobj,
 }
 KSM_ATTR_RO(pages_volatile);
 
+static ssize_t pages_skipped_show(struct kobject *kobj,
+				  struct kobj_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "%lu\n", ksm_pages_skipped);
+}
+KSM_ATTR_RO(pages_skipped);
+
 static ssize_t ksm_zero_pages_show(struct kobject *kobj,
 				struct kobj_attribute *attr, char *buf)
 {
@@ -3453,6 +3733,168 @@ static ssize_t full_scans_show(struct kobject *kobj,
 }
 KSM_ATTR_RO(full_scans);
 
+static ssize_t smart_scan_show(struct kobject *kobj,
+			       struct kobj_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "%u\n", ksm_smart_scan);
+}
+
+static ssize_t smart_scan_store(struct kobject *kobj,
+				struct kobj_attribute *attr,
+				const char *buf, size_t count)
+{
+	int err;
+	bool value;
+
+	err = kstrtobool(buf, &value);
+	if (err)
+		return -EINVAL;
+
+	ksm_smart_scan = value;
+	return count;
+}
+KSM_ATTR(smart_scan);
+
+static ssize_t advisor_mode_show(struct kobject *kobj,
+				 struct kobj_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "%u\n", ksm_advisor);
+}
+
+static ssize_t advisor_mode_store(struct kobject *kobj,
+				  struct kobj_attribute *attr, const char *buf,
+				  size_t count)
+{
+	unsigned int mode;
+	int err;
+
+	err = kstrtouint(buf, 10, &mode);
+	if (err)
+		return -EINVAL;
+	if (mode > KSM_ADVISOR_LAST)
+		return -EINVAL;
+
+	/* Set advisor default values */
+	ksm_advisor = mode;
+	init_advisor();
+	set_advisor_defaults();
+
+	return count;
+}
+KSM_ATTR(advisor_mode);
+
+static ssize_t advisor_min_cpu_show(struct kobject *kobj,
+				    struct kobj_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "%u\n", ksm_advisor_min_cpu);
+}
+
+static ssize_t advisor_min_cpu_store(struct kobject *kobj,
+				     struct kobj_attribute *attr,
+				     const char *buf, size_t count)
+{
+	int err;
+	unsigned long value;
+
+	err = kstrtoul(buf, 10, &value);
+	if (err)
+		return -EINVAL;
+
+	ksm_advisor_min_cpu = value;
+	return count;
+}
+KSM_ATTR(advisor_min_cpu);
+
+static ssize_t advisor_max_cpu_show(struct kobject *kobj,
+				    struct kobj_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "%u\n", ksm_advisor_max_cpu);
+}
+
+static ssize_t advisor_max_cpu_store(struct kobject *kobj,
+				     struct kobj_attribute *attr,
+				     const char *buf, size_t count)
+{
+	int err;
+	unsigned long value;
+
+	err = kstrtoul(buf, 10, &value);
+	if (err)
+		return -EINVAL;
+
+	ksm_advisor_max_cpu = value;
+	return count;
+}
+KSM_ATTR(advisor_max_cpu);
+
+static ssize_t advisor_min_pages_show(struct kobject *kobj,
+				      struct kobj_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "%lu\n", ksm_advisor_min_pages);
+}
+
+static ssize_t advisor_min_pages_store(struct kobject *kobj,
+				       struct kobj_attribute *attr,
+				       const char *buf, size_t count)
+{
+	int err;
+	unsigned long value;
+
+	err = kstrtoul(buf, 10, &value);
+	if (err)
+		return -EINVAL;
+
+	ksm_advisor_min_pages = value;
+	return count;
+}
+KSM_ATTR(advisor_min_pages);
+
+static ssize_t advisor_max_pages_show(struct kobject *kobj,
+				      struct kobj_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "%lu\n", ksm_advisor_max_pages);
+}
+
+static ssize_t advisor_max_pages_store(struct kobject *kobj,
+				       struct kobj_attribute *attr,
+				       const char *buf, size_t count)
+{
+	int err;
+	unsigned long value;
+
+	err = kstrtoul(buf, 10, &value);
+	if (err)
+		return -EINVAL;
+
+	ksm_advisor_max_pages = value;
+	return count;
+}
+KSM_ATTR(advisor_max_pages);
+
+static ssize_t advisor_target_scan_time_show(struct kobject *kobj,
+					     struct kobj_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "%lu\n", ksm_advisor_target_scan_time);
+}
+
+static ssize_t advisor_target_scan_time_store(struct kobject *kobj,
+					      struct kobj_attribute *attr,
+					      const char *buf, size_t count)
+{
+	int err;
+	unsigned long value;
+
+	err = kstrtoul(buf, 10, &value);
+	if (err)
+		return -EINVAL;
+	if (value < 1)
+		return -EINVAL;
+
+	ksm_advisor_target_scan_time = value;
+	return count;
+}
+KSM_ATTR(advisor_target_scan_time);
+
 static struct attribute *ksm_attrs[] = {
 	&sleep_millisecs_attr.attr,
 	&pages_to_scan_attr.attr,
@@ -3462,6 +3904,7 @@ static struct attribute *ksm_attrs[] = {
 	&pages_sharing_attr.attr,
 	&pages_unshared_attr.attr,
 	&pages_volatile_attr.attr,
+	&pages_skipped_attr.attr,
 	&ksm_zero_pages_attr.attr,
 	&full_scans_attr.attr,
 #ifdef CONFIG_NUMA
@@ -3473,6 +3916,13 @@ static struct attribute *ksm_attrs[] = {
 	&stable_node_chains_prune_millisecs_attr.attr,
 	&use_zero_pages_attr.attr,
 	&general_profit_attr.attr,
+	&smart_scan_attr.attr,
+	&advisor_mode_attr.attr,
+	&advisor_min_cpu_attr.attr,
+	&advisor_max_cpu_attr.attr,
+	&advisor_min_pages_attr.attr,
+	&advisor_max_pages_attr.attr,
+	&advisor_target_scan_time_attr.attr,
 	NULL,
 };
 
@@ -3490,7 +3940,8 @@ static int __init ksm_init(void)
 	/* The correct value depends on page size and endianness */
 	zero_checksum = calc_checksum(ZERO_PAGE(0));
 	/* Default to false for backwards compatibility */
-	ksm_use_zero_pages = false;
+	ksm_use_zero_pages = true;
+	init_advisor();
 
 	err = ksm_slab_init();
 	if (err)
