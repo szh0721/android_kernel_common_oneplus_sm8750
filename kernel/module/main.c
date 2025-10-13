@@ -2408,7 +2408,7 @@ static char *custom_module_blacklist[] = {
 	 "coresight_stm", "coresight_tmc_sec",
 #ifdef CONFIG_DEBLOAT_VENDOR_MODULES
 	"f_fs_ipc_log", "qcom_iommu_debug", "qti_battery_debug",
-	"rdbg", "stm_console", "stm_core", "stm_ftrace",
+	"rdbg", "stm_heartbeat", "stm_p_ost", "stm_core", "stm_ftrace", "stm_console",
 	"spmi_pmic_arb_debug",
 #endif
 #ifdef CONFIG_STAR_BLACK_LIST
